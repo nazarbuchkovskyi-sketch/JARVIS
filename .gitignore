@@ -1,0 +1,16 @@
+# runtime
+logs/
+workspace/
+.window-profile/
+config.tmp
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# large local models (download with: python -m jarvis.setup_models)
+models/
+
+# ui
+ui/node_modules/
+ui/dist/
+ui/*.tsbuildinfo

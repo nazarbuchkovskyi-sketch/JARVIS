@@ -1,0 +1,49 @@
+{
+  "language": "ru",
+  "assistant_name": "Джарвис",
+  "user_title": "сэр",
+  "humor": 60,
+  "profanity": false,
+  "wake_word_required": true,
+  "wake_words": [
+    "джарвис",
+    "jarvis",
+    "джервис",
+    "жарвис",
+    "джарвіс"
+  ],
+  "follow_up_seconds": 10,
+  "ptt_key": "f8",
+  "claude_model": "sonnet",
+  "claude_effort": "low",
+  "claude_allowed_tools": [
+    "Read",
+    "Glob",
+    "Grep",
+    "WebSearch",
+    "WebFetch",
+    "Bash",
+    "PowerShell",
+    "Edit(vault/**)",
+    "Write(vault/**)"
+  ],
+  "claude_disallowed_tools": [
+    "NotebookEdit",
+    "Agent",
+    "Task"
+  ],
+  "stt_model": "small",
+  "stt_beam_size": 1,
+  "mic_device": null,
+  "vad_threshold": 0.5,
+  "vad_min_silence_ms": 700,
+  "max_utterance_seconds": 20,
+  "tts_voice": "ru_RU-ruslan-medium",
+  "tts_length_scale": 1.0,
+  "output_device": null,
+  "camera_enabled": false,
+  "camera_index": 0,
+  "host": "127.0.0.1",
+  "port": 8765,
+  "open_window": true
+}
