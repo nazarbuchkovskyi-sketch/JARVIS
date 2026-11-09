@@ -8,6 +8,7 @@ from __future__ import annotations
 import difflib
 import logging
 import queue
+import random
 import re
 import secrets
 import sys
@@ -75,6 +76,74 @@ def match_wake_word(text: str, wake_words: list[str], cutoff: float = 0.8) -> tu
     return False, text.strip()
 
 
+_STOP_WORDS = {"стоп", "хватит", "заткнись", "тихо", "погоди", "подожди", "харэ", "хорош", "замолчи",
+               "помолчи", "стой", "тсс", "цыц", "stop", "замолкни", "умолкни"}
+_STOP_FILLER = {"ну", "эй", "всё", "все", "да", "ладно", "братан", "бро", "чувак", "слушай", "блин", "бля",
+                "сэр", "уже", "пожалуйста", "секунду", "минуту", "так"}
+
+
+def _words(text: str) -> list[str]:
+    return [w.lower().replace("ё", "е").replace("э", "е").strip("-'’ʼ") for w in _WORD.findall(text)]
+
+
+def is_stop_command(text: str, wake_words: list[str]) -> bool:
+    """ "Стоп", "Джарвис, хватит", "погоди, братан": shut up, no new question."""
+    names = {w.lower() for w in wake_words}
+    words = [w for w in _words(text) if w and w not in names]
+    if not words or len(words) > 4 or not any(w in _STOP_WORDS for w in words):
+        return False
+    return all(w in _STOP_WORDS or w in _STOP_FILLER for w in words)
+
+
+# Short function words say nothing about who spoke: "а", "в", "что" are in every sentence.
+_FUNCTION_WORDS = {"а", "и", "в", "во", "на", "что", "как", "это", "не", "ну", "да", "нет", "с", "со", "к", "ко", "по",
+                   "у", "за", "то", "так", "же", "бы", "ли", "ты", "я", "он", "она", "мы", "вы", "они", "тоже", "из",
+                   "от", "до", "о", "об", "но", "или", "там", "тут", "уже", "еще", "вот", "мне", "тебе", "его", "ее"}
+
+
+def _content(words: list[str]) -> list[str]:
+    # Digits are left out too: STT writes "8" where Jarvis said "восемь".
+    return [w for w in words if len(w) > 2 and w not in _FUNCTION_WORDS and not w.isdigit()]
+
+
+def is_echo(heard: str, spoken: list[str], threshold: float = 0.6) -> bool:
+    """True when the mic most likely picked up Jarvis's own voice from the speaker.
+
+    The user cutting in on the same topic ("завтра тоже дождь?") shares a word or two with
+    what Jarvis said, so short phrases also need a two-word sequence he actually spoke.
+    """
+    heard_words = _words(heard)
+    spoken_words = _words(" ".join(spoken))
+    words = _content(heard_words)
+    pool = set(spoken_words)
+    if not pool:
+        return False
+    if not words:  # only "да", "нет", "а": echo only if he really said each of them
+        return all(w in pool for w in heard_words if not w.isdigit())
+    matched = sum(1 for w in words if w in pool or difflib.get_close_matches(w, pool, 1, 0.75))
+    if matched / len(words) < threshold:
+        return False
+    if len(words) > 3:
+        return True
+    if len(heard_words) < 2:  # a single word ("Слушаю."): matched above, no pair to check
+        return True
+    pairs = set(zip(spoken_words, spoken_words[1:]))
+    return any(pair in pairs for pair in zip(heard_words, heard_words[1:]))
+
+
+def proactive_delay(base_min: float, base_max: float, streak: int, rng=random) -> float:
+    """Seconds of quiet before Jarvis speaks up on his own; backs off while he is ignored."""
+    delay = rng.uniform(base_min, max(base_min, base_max))
+    return min(600.0, delay * (2 ** max(0, streak - 2)))
+
+
+def is_skip(text: str) -> bool:
+    """Claude's "nothing worth saying" answer to a proactive look at the camera
+    (also "**SKIP**" or "Гляну. SKIP" — the token anywhere means silence)."""
+    t = re.sub(r"[^\wА-Яа-яЁё]+", " ", text).upper().split()
+    return "SKIP" in t or (bool(t) and t[0] == "ПРОПУСК")
+
+
 class EventBus:
     """Thread-safe fan-out of JSON events to any number of async subscribers."""
 
@@ -127,11 +196,18 @@ class Jarvis:
         self._cancel = threading.Event()
         self._busy = threading.Event()
         self._booted = threading.Event()
-        self._voice_lock = threading.Lock()
         self._gen = 0
         self._gate_lock = threading.Lock()
         self._ptt_lock = threading.Lock()  # push-to-talk events are applied strictly in order
         self.window_open = False
+        # What the turn worker is doing right now (for barge-in decisions).
+        self._current: Optional[dict] = None
+        self._last_activity = time.time()  # last user speech or end of a turn
+        self._proactive_streak = 0  # proactive remarks in a row without the user speaking
+        self._proactive_due = 0.0
+        self._barge: Optional[dict] = None  # an interruption waiting for the rest of the sentence
+        self._barge_lock = threading.Lock()
+        self._barge_wait = 0.9  # seconds to wait for the rest of an interrupting sentence
         self.brain = None
         self.ears = None
         self.voice = None
@@ -164,8 +240,7 @@ class Jarvis:
             "state": self.state,
             "status": dict(self.status),
             "history": list(self.history),
-            "config": {k: cfg[k] for k in ("humor", "profanity", "wake_word_required", "tts_voice", "camera_enabled", "assistant_name", "claude_model")},
-            "voices": self.voice.available_voices() if self.voice else [],
+            "config": {k: cfg[k] for k in ("humor", "profanity", "wake_word_required", "proactive", "tts_voice", "camera_enabled", "assistant_name", "claude_model")},
             "approval": None if p is None else {"id": p.id, "tool": p.tool, "command": p.command},
         }
 
@@ -174,6 +249,7 @@ class Jarvis:
         threading.Thread(target=self._boot, daemon=True, name="boot").start()
         threading.Thread(target=self._turn_loop, daemon=True, name="turns").start()
         threading.Thread(target=self._ticker, daemon=True, name="ticker").start()
+        threading.Thread(target=self._proactive_loop, daemon=True, name="proactive").start()
 
     def _brain_settings(self, frame_path: Path):
         from .brain import BrainSettings
@@ -265,12 +341,13 @@ class Jarvis:
                 on_level=self._on_mic_level,
                 on_speech_start=self._on_speech_start,
                 on_speech_end=self._on_speech_end,
+                is_talking=lambda: bool(self.voice and (self.voice.speaking or time.time() - self.voice.last_sound_at < 0.4)),
             )
             self.ears.load()
             with self._gate_lock:  # a window opening right now must not be missed
                 self.ears.set_gate(self.window_open)
                 self.ears.start()
-            self.set_status("ears", f"Whisper · {cfg['stt_model']}")
+            self.set_status("ears", f"{self.ears.engine} · {cfg['stt_model']}")
             self._start_hotkey()
         except Exception as exc:
             log.exception("ears failed")
@@ -412,44 +489,165 @@ class Jarvis:
 
     def _on_speech_end(self) -> None:
         """A sound was too short to be speech (cough, click): leave "listening"."""
-        if not self._busy.is_set() and self.state == "listening" and not (self.ears and self.ears.ptt_active):
+        self._settle_state()
+
+    def _settle_state(self) -> None:
+        """When no turn runs, show "listening" while someone talks, otherwise "idle"."""
+        if self._busy.is_set():
+            return
+        ears = self.ears
+        if self.window_open and (self._barge is not None or (ears and (ears.ptt_active or ears.segmenter.active))):
+            self.set_state("listening")
+        elif self._turns.empty():
             self.set_state("idle")
 
-    def _on_utterance(self, text: str, seconds: float, forced: bool = False) -> None:
+    def _heard_echo(self, text: str, started_at: float) -> bool:
+        """The mic stays open while Jarvis talks, so it also hears the speaker."""
+        v = self.voice
+        if v is None or not text:
+            return False
+        if not v.speaking and started_at > v.last_sound_at + 0.6:
+            return False  # began after Jarvis went quiet: that is the user
+        return is_echo(text, list(v.recent))
+
+    def _on_utterance(self, text: str, seconds: float, forced: bool = False, started_at: Optional[float] = None) -> None:
         if not self.window_open:
             return  # the window was closed while this was being transcribed
-        # 1) An open approval question takes a short yes/no, no wake word needed.
+        if started_at is None:
+            started_at = time.time() - seconds
+        # 1) An open approval question takes a short yes/no, no wake word needed. Only speech
+        # that began while Jarvis was still clearly talking can be his own "Да или нет?".
         if self.approvals.pending is not None:
+            v = self.voice
+            if text and not forced and v is not None and started_at < v.last_sound_at - 0.2 and is_echo(text, list(v.recent)):
+                log.info("echo ignored during approval: %r", text)
+                return
             if text:
                 answer = approval.parse_answer(text)
                 self._log("user", text)
                 if answer is not None:
                     self.approvals.resolve(None, answer, "Разрешено голосом." if answer else "Пользователь ответил «нет».")
             return
+        if not forced and self._heard_echo(text, started_at):
+            log.info("echo ignored: %r", text)
+            self._settle_state()
+            return
+        if text:
+            self._last_activity = time.time()
+            self._proactive_streak = 0
         # 2) Push-to-talk: always addressed to Jarvis; runs after any turn in progress.
         if forced:
             if text:
                 addressed, remainder = match_wake_word(text, self.config["wake_words"])
                 self._turns.put(Turn("query", remainder if addressed and remainder else text, text, self._gen))
-            elif not self._busy.is_set():
-                self.set_state("idle")
-            return
-        # 3) Ambient speech while idle.
-        if self._busy.is_set():
+            else:
+                self._settle_state()
             return
         if not text:
-            self.set_state("idle")
+            self._settle_state()
             return
-        in_follow_up = time.time() < self.follow_until
-        addressed, remainder = match_wake_word(text, self.config["wake_words"])
+        # 3) The rest of a sentence that interrupted Jarvis: ask it as one question.
+        if self._continue_barge(text):
+            return
+        # 4) Speech while Jarvis is thinking or talking: the user cuts in.
+        if self._busy.is_set():
+            self._barge_in(text, started_at)
+            return
+        # 5) Ambient speech while idle.
+        self._ambient(text, started_at)
+
+    def _ambient(self, text: str, started_at: float) -> None:
+        wake = self.config["wake_words"]
+        # Measured from when the user *started* talking: transcription time does not count.
+        in_follow_up = started_at < self.follow_until
+        addressed, remainder = match_wake_word(text, wake)
         if self.config["wake_word_required"] and not addressed and not in_follow_up:
             self._log("heard", text)  # shown faded: heard, but not addressed to Jarvis
-            self.set_state("idle")
+            self._settle_state()
+            return
+        if is_stop_command(text, wake):  # a late "стоп" after he already finished
+            self._log("user", text)
+            self._settle_state()
             return
         if addressed and not remainder:
             self._turns.put(Turn("local", f"Слушаю, {self.config['user_title']}.", text, self._gen))
             return
         self.submit(remainder if addressed else text, shown=text)
+
+    def _barge_in(self, text: str, started_at: float) -> None:
+        """The user talked over Jarvis: shut up at once, then answer the new words."""
+        wake = self.config["wake_words"]
+        cur = self._current or {}
+        kind, spoke = cur.get("kind"), bool(cur.get("spoke"))
+        addressed, remainder = match_wake_word(text, wake)
+        if kind == "proactive" and not spoke and not addressed:
+            # He was only looking at the camera; people talking ("Тихо!" to someone else
+            # included) is not for him. Drop the look and treat it like any room speech.
+            log.info("proactive look dropped, someone talks: %r", text)
+            self.stop()
+            self._ambient(text, started_at)
+            return
+        if is_stop_command(text, wake):
+            log.info("barge-in stop: %r", text)
+            self.stop()
+            self._log("user", text)
+            self.follow_until = time.time() + float(self.config["follow_up_seconds"])
+            return
+        # After "Слушаю, сэр." any phrase is the question, even one word ("Время?").
+        answering_listen = kind == "local"
+        # Jarvis has not said a word yet: this is the rest of the same question
+        # ("Что думаешь..." pause "...о войне?"), so ask both parts together.
+        same_question = kind == "query" and not spoke and time.time() - cur.get("started", 0) < 15
+        if not addressed and not answering_listen and len(_words(text)) < 2:
+            log.info("barge-in ignored (too short): %r", text)
+            return  # a lone "ага" or a cough is not an interruption
+        self.stop()
+        if addressed and not remainder:
+            log.info("barge-in by name: %r", text)
+            self._turns.put(Turn("local", f"Слушаю, {self.config['user_title']}.", text, self._gen))
+            return
+        query = remainder if addressed else text
+        if same_question:
+            query = f"{cur['text']} {query}"
+        log.info("barge-in: %r -> %r", text, query)
+        # While Jarvis talked, the mic was cut into short pieces: the user may still be
+        # mid-sentence. Wait for the rest (see _continue_barge) before asking Claude.
+        with self._barge_lock:
+            self._barge = {"query": query, "shown": text, "at": time.time(), "gen": self._gen}
+        self._settle_state()
+        self._later(self._barge_wait, self._flush_barge)
+
+    @staticmethod
+    def _later(delay: float, fn) -> None:
+        t = threading.Timer(delay, fn)
+        t.daemon = True
+        t.start()
+
+    def _continue_barge(self, text: str) -> bool:
+        with self._barge_lock:
+            pending, self._barge = self._barge, None
+        if pending is None:
+            return False
+        if time.time() - pending["at"] > 8:
+            self._turns.put(Turn("query", pending["query"], pending["shown"], pending["gen"]))
+            return False
+        addressed, remainder = match_wake_word(text, self.config["wake_words"])
+        rest = remainder if addressed else text
+        self._turns.put(Turn("query", f"{pending['query']} {rest}".strip(), f"{pending['shown']} {text}", pending["gen"]))
+        return True
+
+    def _flush_barge(self) -> None:
+        """No continuation came: ask what we have."""
+        with self._barge_lock:
+            pending = self._barge
+            if pending is None:
+                return
+            if self.ears is not None and self.ears.segmenter.active and time.time() - pending["at"] < 8:
+                self._later(0.4, self._flush_barge)  # still talking: wait for the rest
+                return
+            self._barge = None
+        # Stamped with the generation it was made in: a Stop in between drops it.
+        self._turns.put(Turn("query", pending["query"], pending["shown"], pending["gen"]))
 
     def submit(self, text: str, shown: Optional[str] = None) -> None:
         text = text.strip()
@@ -472,6 +670,8 @@ class Jarvis:
         self._gen += 1
         self._cancel.set()
         self.follow_until = 0.0
+        with self._barge_lock:
+            self._barge = None
         while True:
             try:
                 self._turns.get_nowait()
@@ -482,6 +682,7 @@ class Jarvis:
             self.brain.interrupt()
         if self.voice is not None:
             self.voice.stop()
+        self._settle_state()
 
     # ---- approval gate (called from the hook via the server) ---------------
     def request_approval(self, tool: str, tool_input: dict) -> tuple[bool, str]:
@@ -500,13 +701,8 @@ class Jarvis:
             if not pending.event.is_set():
                 self.voice.say(f"{self.config['user_title'].capitalize()}, нужно ваше разрешение. Да или нет?")
                 self._wait_voice(limit=max(0.0, deadline - time.time() - 60))
-        time.sleep(0.3)  # let the speaker echo die down before listening for the answer
-        if self.ears is not None and not pending.event.is_set():
-            self.ears.resume()  # listen for "да" / "нет"
         if not pending.event.wait(max(1.0, deadline - time.time())):
             self.approvals.resolve(pending.id, False, "Время на ответ вышло.")
-        if self.ears is not None:
-            self.ears.pause()
         self.emit({"type": "approval_done", "id": pending.id, "allowed": pending.allowed})
         self._log("system", "Команда разрешена." if pending.allowed else f"Команда отклонена: {pending.reason}")
         if not self._cancel.is_set():
@@ -532,15 +728,18 @@ class Jarvis:
             self._cancel.clear()
             if turn.gen != self._gen:  # Stop landed between the check and clear()
                 self._cancel.set()
-            if self.ears:
-                self.ears.pause()
+            # The mic stays open during the turn so the user can cut in (see _barge_in).
+            self._current = {"kind": turn.kind, "text": turn.text, "started": time.time(), "spoke": False}
             try:
                 if turn.kind == "local":
                     self._log("user", turn.shown)
                     if self.voice is not None:
                         self.set_state("speaking")
                         self._log("assistant", turn.text)
+                        self._current["spoke"] = True
                         self.voice.say(turn.text)
+                elif turn.kind == "proactive":
+                    self._handle(turn.text, turn.shown, proactive=True)
                 else:
                     self._handle(turn.text, turn.shown)
                 self._wait_voice()
@@ -548,43 +747,68 @@ class Jarvis:
                 log.exception("turn failed")
                 self._log("system", f"Ошибка: {exc}")
             finally:
-                self._finish_turn(cancelled=self._cancel.is_set())
+                spoke = bool(self._current and self._current.get("spoke"))
+                self._current = None
+                self._finish_turn(cancelled=self._cancel.is_set(), spoke=spoke)
 
-    def _finish_turn(self, cancelled: bool = False) -> None:
-        time.sleep(0.25)  # let the room echo die down
-        # No follow-up window after Stop: whatever is said next is not for Jarvis.
-        self.follow_until = 0.0 if cancelled else time.time() + float(self.config["follow_up_seconds"])
-        if self.ears:
-            self.ears.resume()
+    def _finish_turn(self, cancelled: bool = False, spoke: bool = True) -> None:
+        # After Stop, stop() already decided the follow-up window (a spoken "стоп" keeps one open).
+        if not cancelled:
+            # No follow-up window after a silent (skipped) proactive look.
+            self.follow_until = time.time() + float(self.config["follow_up_seconds"]) if spoke else 0.0
+        self._last_activity = time.time()
         self._busy.clear()
-        self.set_state("idle")
+        self._settle_state()
 
-    def _handle(self, text: str, shown: str) -> None:
+    def _handle(self, text: str, shown: str, proactive: bool = False) -> None:
         from .voice import SentenceSplitter
 
-        self._log("user", shown)
+        if not proactive:
+            self._log("user", shown)
         if self.brain is None:
             self._log("system", "Мозг не подключён.")
             return
         if self._cancel.is_set():
             return
 
-        self.set_state("thinking")
+        if not proactive:
+            self.set_state("thinking")
         splitter = SentenceSplitter()
         turn_id = f"t{int(time.time() * 1000)}"
-        self.emit({"type": "assistant_start", "id": turn_id})
+        t0 = time.time()
+        st = {"started": False, "first": None}
 
-        def on_delta(delta: str) -> None:
+        def speak(delta: str) -> None:
             if self._cancel.is_set():
                 return
+            if not st["started"]:
+                st["started"] = True
+                self.emit({"type": "assistant_start", "id": turn_id})
             self.emit({"type": "assistant_delta", "id": turn_id, "text": delta})
             if self.voice:
                 for sentence in splitter.feed(delta):
+                    if st["first"] is None:
+                        st["first"] = time.time() - t0
+                    if self._current is not None:
+                        self._current["spoke"] = True
                     self.voice.say(sentence)
                     if self.approvals.pending is None:
                         self.set_state("speaking")
 
+        if not proactive:  # a proactive remark is shown only once we know it is not "SKIP"
+            st["started"] = True
+            self.emit({"type": "assistant_start", "id": turn_id})
+
+        def on_delta(delta: str) -> None:
+            if self._cancel.is_set():
+                return
+            if proactive:
+                return  # decided at the end: it may turn out to be "SKIP"
+            speak(delta)
+
         def on_tool(summary: str) -> None:
+            if proactive:
+                return  # a silent look at the camera: no "thinking" flicker in the window
             self.emit({"type": "tool", "id": turn_id, "text": summary})
             if self.approvals.pending is None:
                 self.set_state("thinking")
@@ -599,25 +823,38 @@ class Jarvis:
             cancel=self._cancel,
         )
 
-        if not self._cancel.is_set() and self.voice:
+        skipped = proactive and (not result.ok or self._cancel.is_set() or is_skip(result.text or "")
+                                 or not (result.text or "").strip())
+        if proactive and not skipped:
+            speak(result.text)
+        if not self._cancel.is_set() and self.voice and not skipped:
             for sentence in splitter.flush():
+                if self._current is not None:
+                    self._current["spoke"] = True
                 self.voice.say(sentence)
                 self.set_state("speaking")
+        log.info("turn %s: first sentence %.2fs, total %.2fs%s | %r", "proactive" if proactive else "query",
+                 st["first"] or -1, time.time() - t0, " (skipped)" if skipped else "", (result.text or "")[:300])
+        if proactive and skipped:
+            if not result.ok:
+                log.warning("proactive turn failed: %s", result.error)
+            return  # nothing worth saying: nothing was shown or spoken
         if result.ok:
-            self._log("assistant", result.text or "…", id=turn_id, interrupted=result.interrupted or self._cancel.is_set())
+            self._log("assistant", result.text or "…", id=turn_id, interrupted=result.interrupted or self._cancel.is_set(),
+                      **({"proactive": True} if proactive else {}))
         else:
             self._log("system", f"Ошибка мозга: {result.error}", id=turn_id)
             if self.voice and not self._cancel.is_set():
+                if self._current is not None:
+                    self._current["spoke"] = True
                 self.voice.say(f"Простите, {self.config['user_title']}, связь с мозгом барахлит.")
-        self.emit({"type": "assistant_end", "id": turn_id})
+        if st["started"]:
+            self.emit({"type": "assistant_end", "id": turn_id})
         if self.voice and self.voice.speaking and not self._cancel.is_set():
             self.set_state("speaking")
 
     # ---- runtime settings --------------------------------------------------
     def apply_setting(self, key: str, value: Any) -> None:
-        if key == "tts_voice":
-            self._switch_voice(str(value))
-            return
         try:
             value = self.config.set_runtime(key, value)
         except OSError as exc:
@@ -627,13 +864,35 @@ class Jarvis:
             self.set_status("eyes", "включено" if value else "выключено")
         self.emit({"type": "config", "key": key, "value": value})
 
-    def _switch_voice(self, name: str) -> None:
-        if self.voice is None:
-            raise ValueError("голос не загружен")
-        if name not in self.voice.available_voices():
-            raise ValueError(f"неизвестный голос {name!r}")
-        with self._voice_lock:  # one switch at a time; save only after it loaded
-            self.voice.load(name)
-            self.config.set_runtime("tts_voice", name)
-        self.set_status("voice", f"Piper · {self.voice.voice_name}")
-        self.emit({"type": "config", "key": "tts_voice", "value": name})
+    # ---- proactive mode: Jarvis looks at the camera and speaks up on his own ---
+    def _proactive_ready(self) -> bool:
+        ears = self.ears
+        return bool(
+            self.config.get("proactive") and self.window_open and self.brain is not None
+            and self.eyes is not None and self.eyes.enabled and not self.eyes.error
+            and not self._busy.is_set() and self._turns.empty() and self.approvals.pending is None
+            and ears is not None and not ears.ptt_active and not ears.segmenter.active
+        )
+
+    def _proactive_loop(self) -> None:
+        self._booted.wait()
+        seen_activity = None
+        while True:
+            time.sleep(1.0)
+            try:
+                if seen_activity != self._last_activity:  # something happened: restart the countdown
+                    seen_activity = self._last_activity
+                    self._proactive_due = self._last_activity + proactive_delay(
+                        float(self.config.get("proactive_min_seconds", 35)),
+                        float(self.config.get("proactive_max_seconds", 70)),
+                        self._proactive_streak)
+                if time.time() < self._proactive_due or not self._proactive_ready():
+                    continue
+                frame = VISION_DIR / "latest.jpg"
+                if not frame.exists() or time.time() - frame.stat().st_mtime > 5:
+                    continue
+                self._proactive_streak += 1
+                self._last_activity = time.time()  # the next countdown starts after this turn
+                self._turns.put(Turn("proactive", persona.proactive_prompt(frame), "", self._gen))
+            except Exception:
+                log.exception("proactive loop failed")

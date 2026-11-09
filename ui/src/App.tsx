@@ -381,18 +381,16 @@ export default function App() {
 
         <article className="fc fc-light">
           <div className="fc-top">
-            <span>[ 03 — ГОЛОС ]</span>
-            <span>ЛОКАЛЬНО</span>
+            <span>[ 03 — ИНИЦИАТИВА ]</span>
+            <span>{s ? voiceLabel(s.tts_voice).toUpperCase() : "—"}</span>
           </div>
-          <h3>{s ? voiceLabel(s.tts_voice) : "—"}</h3>
-          <p className="fc-text">Синтез речи прямо на ноутбуке, без интернета.</p>
-          <select className="select" value={s?.tts_voice ?? ""} onChange={(e) => j.set("tts_voice", e.target.value)} disabled={!s} aria-label="Голос">
-            {j.voices.map((v) => (
-              <option key={v} value={v}>
-                {voiceLabel(v)}
-              </option>
-            ))}
-          </select>
+          <h3>{s?.proactive === false ? "Ждёт команды" : "Сам комментирует"}</h3>
+          <p className="fc-text">
+            Когда тихо — смотрит в камеру и подкалывает. Говорите поверх него — замолчит и ответит; «стоп» — просто замолчит.
+          </p>
+          <div className="fc-row">
+            <Switch label="Сам комментирует" checked={s?.proactive ?? true} disabled={!s} onChange={(v) => j.set("proactive", v)} />
+          </div>
         </article>
 
         <article className="fc fc-dark">

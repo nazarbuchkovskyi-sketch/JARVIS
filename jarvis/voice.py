@@ -6,6 +6,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -82,13 +83,17 @@ class Voice:
         self._piper = None
         self._sample_rate = 22050
         self._text_q: "queue.Queue[Optional[str]]" = queue.Queue()
-        self._audio_q: "queue.Queue[Optional[tuple[np.ndarray, int]]]" = queue.Queue(maxsize=8)
+        self._audio_q: "queue.Queue[Optional[tuple[np.ndarray, int, str]]]" = queue.Queue(maxsize=8)
         self._stop_flag = threading.Event()
         self._generation = 0
         self._pending = 0
         self._pending_lock = threading.Lock()
         self._idle = threading.Event()
         self._idle.set()
+        # What was said lately and when the speaker last made a sound: the mic hears the
+        # speaker too, and this is how that echo is told apart from the user barging in.
+        self.recent: deque[str] = deque(maxlen=8)
+        self.last_sound_at = 0.0
         self.ready = False
 
     # ---- setup -------------------------------------------------------------
@@ -174,7 +179,7 @@ class Voice:
                 continue
             if self._stop_flag.is_set():
                 continue
-            self._audio_q.put((audio, rate))
+            self._audio_q.put((audio, rate, text))
 
     def _play_loop(self) -> None:
         import sounddevice as sd
@@ -192,9 +197,10 @@ class Voice:
                 continue
             if item is None:
                 return
-            audio, rate = item
+            audio, rate, text = item
             try:
                 if not self._stop_flag.is_set() and audio.size:
+                    self.recent.append(text)  # only what really comes out of the speaker
                     if out is not None and out_rate != rate:
                         out.close()
                         out = None
@@ -211,6 +217,7 @@ class Voice:
                             break
                         block = audio[i:i + frame]
                         out.write(block.reshape(-1, 1))
+                        self.last_sound_at = time.time()
                         self.on_level(float(np.sqrt(np.mean(block * block))))
                     if self._stop_flag.is_set() and out is not None:
                         out.abort()

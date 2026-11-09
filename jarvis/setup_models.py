@@ -10,8 +10,6 @@ BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 # (language folder, locale, speaker, quality)
 VOICES = [
     ("ru", "ru_RU", "denis", "medium"),
-    ("ru", "ru_RU", "dmitri", "medium"),
-    ("ru", "ru_RU", "ruslan", "medium"),
 ]
 
 

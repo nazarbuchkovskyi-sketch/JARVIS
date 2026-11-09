@@ -23,6 +23,7 @@ export interface Settings {
   profanity: boolean;
   wake_word_required: boolean;
   tts_voice: string;
+  proactive: boolean;
   camera_enabled: boolean;
   assistant_name: string;
   claude_model: string;
@@ -49,7 +50,6 @@ export function useJarvis() {
   const [status, setStatus] = useState<Record<string, string>>({});
   const [log, setLog] = useState<LogItem[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
-  const [voices, setVoices] = useState<string[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
   const [ptt, setPtt] = useState(false);
   const [approval, setApproval] = useState<Approval | null>(null);
@@ -73,7 +73,6 @@ export function useJarvis() {
             setState(msg.state);
             setStatus(msg.status);
             setSettings(msg.config);
-            setVoices(msg.voices ?? []);
             setLog(
               (msg.history ?? []).map((h: LogItem) => ({ ...h, key: nextKey() })),
             );
@@ -162,7 +161,6 @@ export function useJarvis() {
     status,
     log,
     settings,
-    voices,
     stats,
     ptt,
     approval,

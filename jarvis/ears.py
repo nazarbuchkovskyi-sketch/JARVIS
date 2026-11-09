@@ -1,4 +1,5 @@
-"""Ears: microphone capture, Silero VAD segmentation and faster-whisper transcription.
+"""Ears: microphone capture, Silero VAD segmentation and speech-to-text
+(GigaAM v3 via onnx-asr — fast and accurate for Russian — or faster-whisper).
 
 Everything here runs locally on the CPU.
 """
@@ -93,10 +94,11 @@ class Ears:
         min_silence_ms: int,
         max_utterance_seconds: float,
         initial_prompt: str,
-        on_utterance: Callable[[str, float, bool], None],
+        on_utterance: Callable[..., None],
         on_level: Callable[[float], None] = lambda _l: None,
         on_speech_start: Callable[[], None] = lambda: None,
         on_speech_end: Callable[[], None] = lambda: None,
+        is_talking: Callable[[], bool] = lambda: False,
     ):
         self.language = language
         self.beam_size = beam_size
@@ -107,9 +109,15 @@ class Ears:
         self.on_speech_start = on_speech_start
         self.on_speech_end = on_speech_end
         self.segmenter = Segmenter(vad_threshold, min_silence_ms, max_utterance_seconds)
+        # While Jarvis talks the mic also hears the speaker, which never pauses long enough
+        # to end an utterance: cut short pieces so the user's words are not buried in echo.
+        self.is_talking = is_talking
+        self._normal_limits = (self.segmenter.silence_blocks, self.segmenter.max_blocks)
+        self._talk_limits = (max(1, int(0.3 * SAMPLE_RATE / BLOCK)), int(2.5 * SAMPLE_RATE / BLOCK))
         self._stt_model_name = stt_model
         self._blocks: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=400)
-        self._utterances: "queue.Queue[tuple[np.ndarray, bool]]" = queue.Queue(maxsize=3)
+        # (audio, forced, started_at): when the speaker started, for the follow-up window.
+        self._utterances: "queue.Queue[tuple[np.ndarray, bool, float]]" = queue.Queue(maxsize=3)
         self._paused = threading.Event()
         # Closed while no Jarvis window is open: the mic is then ignored completely.
         self._gate = threading.Event()
@@ -119,18 +127,30 @@ class Ears:
         self._stop = threading.Event()
         self._stream = None
         self.whisper = None
+        self.asr = None  # onnx-asr model (GigaAM)
         self.vad = None
         self.ready = False
 
     # ---- setup -------------------------------------------------------------
+    @property
+    def engine(self) -> str:
+        return "GigaAM" if self._stt_model_name.startswith("gigaam") else "Whisper"
+
     def load(self) -> None:
-        from faster_whisper import WhisperModel
         from silero_vad import load_silero_vad
 
         t = time.time()
         self.vad = load_silero_vad(onnx=True)
-        self.whisper = WhisperModel(self._stt_model_name, device="cpu", compute_type="int8")
-        log.info("ears loaded in %.1fs (whisper=%s)", time.time() - t, self._stt_model_name)
+        if self.engine == "GigaAM":
+            import onnx_asr
+
+            self.asr = onnx_asr.load_model(self._stt_model_name)
+            self.asr.recognize(np.zeros(SAMPLE_RATE // 2, np.float32), sample_rate=SAMPLE_RATE)  # warm up
+        else:
+            from faster_whisper import WhisperModel
+
+            self.whisper = WhisperModel(self._stt_model_name, device="cpu", compute_type="int8")
+        log.info("ears loaded in %.1fs (%s)", time.time() - t, self._stt_model_name)
         self.ready = True
 
     def start(self) -> None:
@@ -183,6 +203,7 @@ class Ears:
     def ptt_begin(self) -> None:
         with self._ptt_lock:
             self._ptt_buf = []
+            self._ptt_started = time.time()
             self._ptt.set()
 
     def ptt_end(self) -> bool:
@@ -192,12 +213,13 @@ class Ears:
                 return False
             self._ptt.clear()
             buf, self._ptt_buf = self._ptt_buf, []
+            started = getattr(self, "_ptt_started", time.time())
         if len(buf) * BLOCK < SAMPLE_RATE * 0.3:
             return False  # too short to be speech
         audio = np.concatenate(buf)
         while True:  # push-to-talk wins over queued ambient speech
             try:
-                self._utterances.put_nowait((audio, True))
+                self._utterances.put_nowait((audio, True, started))
                 return True
             except queue.Full:
                 try:
@@ -241,6 +263,8 @@ class Ears:
             if not self._gate.is_set():
                 if now - last_level > 0.05:
                     self.on_level(0.0)
+                if self.segmenter.active:  # the window closed mid-phrase: forget it
+                    self.segmenter.reset()
                 continue
             if ptt:
                 with self._ptt_lock:
@@ -250,6 +274,8 @@ class Ears:
             if self.paused or len(block) != BLOCK:
                 continue
             try:
+                self.segmenter.silence_blocks, self.segmenter.max_blocks = (
+                    self._talk_limits if self.is_talking() else self._normal_limits)
                 prob = float(self.vad(torch.from_numpy(block), SAMPLE_RATE).item())
                 was_active = self.segmenter.active
                 audio = self.segmenter.push(block, prob)
@@ -259,7 +285,7 @@ class Ears:
                     self.on_speech_end()  # too short: a cough or a click
                 if audio is not None:
                     try:
-                        self._utterances.put_nowait((audio, False))
+                        self._utterances.put_nowait((audio, False, now - len(audio) / SAMPLE_RATE))
                     except queue.Full:
                         log.warning("ears busy, dropping ambient utterance")
                         self.on_speech_end()
@@ -270,7 +296,7 @@ class Ears:
     def _stt_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                audio, forced = self._utterances.get(timeout=0.5)
+                audio, forced, started = self._utterances.get(timeout=0.5)
             except queue.Empty:
                 continue
             if self.paused and not forced:
@@ -284,11 +310,13 @@ class Ears:
             log.info("stt %.1fs audio -> %.2fs: %r", len(audio) / SAMPLE_RATE, time.time() - t, text)
             if forced or not self.paused:
                 try:
-                    self.on_utterance(text, len(audio) / SAMPLE_RATE, forced)
+                    self.on_utterance(text, len(audio) / SAMPLE_RATE, forced, started)
                 except Exception:
                     log.exception("utterance handler failed")
 
     def transcribe(self, audio: np.ndarray) -> str:
+        if self.asr is not None:
+            return clean_transcript(str(self.asr.recognize(audio.astype(np.float32), sample_rate=SAMPLE_RATE)))
         assert self.whisper is not None
         segments, _info = self.whisper.transcribe(
             audio,

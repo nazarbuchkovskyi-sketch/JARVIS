@@ -11,7 +11,7 @@ if not exist "ui\dist\index.html" (
   popd
 )
 
-if not exist "models\piper\ru_RU-ruslan-medium.onnx" (
+if not exist "models\piper\ru_RU-denis-medium.onnx" (
   echo [Jarvis] Downloading the voice model...
   python -m jarvis.setup_models || goto :fail
 )
