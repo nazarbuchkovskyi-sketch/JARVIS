@@ -26,7 +26,7 @@
 ```bat
 git clone https://github.com/nazarbuchkovskyi-sketch/JARVIS.git
 cd JARVIS
-setup.bat
+.setup.bat
 ```
 
 `setup.bat` ставить Python-пакети точних версій (`requirements.txt`), збирає інтерфейс і завантажує моделі: голос Piper `ru_RU-denis-medium` (~60 МБ) і розпізнавання мови GigaAM v3 (~850 МБ, у `~/.cache/huggingface`). Займає 5–15 хвилин залежно від інтернету.
@@ -34,7 +34,7 @@ setup.bat
 ## Запуск
 
 ```bat
-start.bat
+.start.bat
 ```
 
 Відкриється окреме вікно Джарвіса (запуск ~20 с). Скажіть «Джарвис, привет».
