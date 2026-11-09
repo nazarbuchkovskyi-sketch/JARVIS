@@ -265,7 +265,9 @@ class Jarvis:
             allowed_tools=list(cfg["claude_allowed_tools"]),
             disallowed_tools=list(cfg["claude_disallowed_tools"]),
             # Jarvis must not inherit the user's global coding instructions.
-            exclude_claude_md=[f"{home}/.claude/CLAUDE.md", f"{home}/.claude/**"],
+            # Nor the repo's own CLAUDE.md/AGENTS.md (setup instructions for Claude Code, not for him).
+            exclude_claude_md=[f"{home}/.claude/CLAUDE.md", f"{home}/.claude/**",
+                               f"{ROOT.as_posix()}/CLAUDE.md", f"{ROOT.as_posix()}/AGENTS.md"],
             # Every shell command and web fetch goes through the approval gate.
             extra_settings={"hooks": {"PreToolUse": [{
                 "matcher": "Bash|PowerShell|WebFetch",

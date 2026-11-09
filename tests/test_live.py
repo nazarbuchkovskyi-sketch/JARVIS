@@ -408,3 +408,11 @@ def test_window_close_with_queued_turn_goes_idle(tmp_path):
     j.state = "listening"
     j.set_window_open(False)
     assert j.state == "idle" and turns(j) == []
+
+
+def test_repo_setup_instructions_are_hidden_from_jarvis(tmp_path):
+    from jarvis.config import ROOT, VISION_DIR
+
+    j = Jarvis(Config(tmp_path / "config.json"))
+    ex = j._brain_settings(VISION_DIR / "latest.jpg").exclude_claude_md
+    assert f"{ROOT.as_posix()}/CLAUDE.md" in ex and any(e.endswith("/.claude/CLAUDE.md") for e in ex)
