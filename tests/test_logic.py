@@ -225,3 +225,25 @@ def test_secret_paths_always_denied(tmp_path):
     deny = Config(cfg_file)["claude_disallowed_tools"]
     assert "Agent" in deny
     assert "Read(~/.claude/**)" in deny and "Read(~/.ssh/**)" in deny and "Grep(~/.claude/**)" in deny
+
+
+@pytest.mark.parametrize("cmd", [
+    # second review: file reads via flags, GNU sort after a pipe, PowerShell parameter prefixes,
+    # mixed-slash UNC paths, env/registry drives
+    "date --file=/c/Users/Admin/.claude/.credentials.json", "date -f x", "echo x | sort ~/.ssh/id_rsa",
+    "echo x | sort -o a", "Get-Process | sort --compress-program=calc", "Get-Service -Comp evil.attacker.com",
+    "Get-HotFix -Cn:attacker.com", r"Get-ChildItem \/attacker.com/share", r"Get-ChildItem /\attacker.com\share",
+    "gci Env:", "ls env:JARVIS_TOKEN", "gci HKCU:/Software", "Get-Process | Select-Object -ExpandProperty x",
+])
+def test_second_review_bypasses_blocked(cmd):
+    assert not is_safe(cmd)
+
+
+@pytest.mark.parametrize("text", ["так себе", "ага щас", "ок давай не будем", "да, но не сейчас", "так, подожди"])
+def test_casual_speech_never_approves(text):
+    assert parse_answer(text) is not True
+
+
+@pytest.mark.parametrize("text", ["это Джарвис", "сказал Джарвис", "так Джарвис сказал что"])
+def test_mentions_do_not_wake(text):
+    assert match_wake_word(text, WAKE)[0] is False

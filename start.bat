@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title J.A.R.V.I.S.
+title Jarvis
 
 if not exist "ui\dist\index.html" (
   echo [Jarvis] Building the interface...
@@ -11,7 +11,7 @@ if not exist "ui\dist\index.html" (
   popd
 )
 
-if not exist "models\piper\uk_UA-mykyta-high.onnx" (
+if not exist "models\piper\ru_RU-ruslan-medium.onnx" (
   echo [Jarvis] Downloading the voice model...
   python -m jarvis.setup_models || goto :fail
 )

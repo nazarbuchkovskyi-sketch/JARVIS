@@ -25,7 +25,7 @@ log = logging.getLogger("jarvis.core")
 
 _WORD = re.compile(r"[\w'’ʼ-]+", re.UNICODE)
 # Words that may come before an address: "Слушай, Джарвис, ...", "Эй, Джарвис".
-_INTERJECTIONS = {"слушай", "эй", "ей", "ну", "о", "а", "привет", "хей", "hey", "окей", "ок", "алло", "так", "слухай", "гей"}
+_INTERJECTIONS = {"слушай", "эй", "ей", "ну", "привет", "хей", "hey", "окей", "алло", "слухай", "гей"}
 
 
 def _is_name(word: str, target: str, cutoff: float) -> bool:
@@ -49,7 +49,10 @@ def match_wake_word(text: str, wake_words: list[str], cutoff: float = 0.8) -> tu
     tokens = list(_WORD.finditer(text))
     for idx, tok in enumerate(tokens):
         first = idx == 0 or (idx == 1 and tokens[0].group(0).lower() in _INTERJECTIONS)
-        if not first and idx != len(tokens) - 1:
+        # A trailing name is an address only when set off by a comma/dash: "Который час, Джарвис?"
+        # ("сказал Джарвис" / "это Джарвис" are talk *about* him).
+        last = idx == len(tokens) - 1 and idx > 0 and bool(re.search(r"[,—–-]\s*$", text[: tok.start()]))
+        if not first and not last:
             continue
         word = tok.group(0).lower().strip("-'’ʼ")
         inflected = any(len(word) > len(t) and word.startswith(t[:-1]) for t in targets)

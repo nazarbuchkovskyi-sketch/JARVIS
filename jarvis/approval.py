@@ -14,29 +14,68 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlsplit
 
-# Read-only commands that take no arguments other than flags.
-NO_ARGS = {
-    "get-date", "date", "hostname", "whoami", "systeminfo", "tasklist", "get-uptime", "uptime",
-    "get-culture", "get-timezone", "get-location", "pwd", "uname", "free", "df", "get-computerinfo",
-    "get-volume", "get-psdrive", "get-netadapter", "get-netipaddress", "get-netipconfiguration", "get-hotfix",
+# Read-only commands and the EXACT flags each may take (no abbreviations, no values).
+# PowerShell accepts any unambiguous prefix of a parameter ("-Comp" = -ComputerName),
+# so only listed spellings pass; GNU tools take --opt=value, which never matches.
+NO_ARGS: dict[str, set[str]] = {
+    "get-date": set(), "date": set(), "hostname": set(), "whoami": set(), "systeminfo": set(),
+    "tasklist": set(), "get-uptime": set(), "uptime": set(), "get-culture": set(), "get-timezone": set(),
+    "get-location": set(), "pwd": set(), "uname": {"-a"}, "free": {"-h", "-m"}, "df": {"-h"},
+    "get-computerinfo": set(), "get-volume": set(), "get-psdrive": set(), "get-netadapter": set(),
+    "get-netipaddress": set(), "get-netipconfiguration": set(), "get-hotfix": set(),
 }
 # Read-only commands whose arguments are plain names (process, service, CIM class).
-NAME_ARGS = {"get-process", "gps", "get-service", "gsv", "get-ciminstance", "get-wmiobject"}
-# Listing directories / checking existence: path arguments allowed (never UNC).
-PATH_ARGS = {"get-childitem", "gci", "ls", "dir", "test-path"}
+NAME_ARGS: dict[str, set[str]] = {
+    "get-process": {"-name", "-id"}, "gps": {"-name", "-id"},
+    "get-service": {"-name", "-displayname"}, "gsv": {"-name", "-displayname"},
+    "get-ciminstance": {"-classname"}, "get-wmiobject": {"-class"},
+}
+# Listing directories / checking existence: local path arguments only.
+PATH_ARGS: dict[str, set[str]] = {
+    "get-childitem": {"-recurse", "-force", "-name", "-directory", "-file", "-filter", "-depth"},
+    "gci": {"-recurse", "-force", "-name", "-directory", "-file", "-filter", "-depth"},
+    "dir": {"-recurse", "-force", "-name", "-directory", "-file", "-filter", "-depth"},
+    "ls": {"-l", "-a", "-la", "-al", "-lh", "-lah", "-1", "-r", "-t", "-lt", "-ltr"},
+    "test-path": set(),
+}
 # Printing literal text.
 TEXT_ARGS = {"echo", "write-output", "write-host"}
 EXACT = {"ipconfig": {(), ("/all",)}}
 
-# Output shapers allowed after a pipe. None of them takes a file path.
-PIPE_FILTERS = {
-    "select-object", "select", "sort-object", "sort", "format-table", "ft", "format-list", "fl",
-    "format-wide", "measure-object", "measure", "group-object", "convertto-json", "out-string",
+# PowerShell output shapers allowed after a pipe (never GNU sort/grep: those read files).
+PIPE_FILTERS: dict[str, set[str]] = {
+    "select-object": {"-first", "-last", "-skip", "-unique", "-property"},
+    "sort-object": {"-descending", "-unique", "-property"},
+    "format-table": {"-autosize", "-wrap", "-property"}, "ft": {"-autosize", "-wrap", "-property"},
+    "format-list": {"-property"}, "fl": {"-property"},
+    "measure-object": {"-sum", "-average", "-maximum", "-minimum", "-property"},
+    "group-object": {"-noelement", "-property"},
+    "convertto-json": {"-depth", "-compress"}, "out-string": {"-width"},
 }
-# Parameters that would make an otherwise harmless command read/write files or run code.
-BAD_PARAMS = re.compile(r"^-(path|literalpath|filepath|inputobject|outfile|outvariable|ov|ev|errorvariable|"
-                        r"computername|cimsession|session|credential|scriptblock|"
-                        r"argumentlist|verb|encodedcommand|e|ec|c|command|exec)\b", re.IGNORECASE)
+
+_PLAIN = re.compile(r"[A-Za-z0-9_.*,\-]+")                    # names, numbers, property lists
+_LOCAL_PATH = re.compile(r"(?:[A-Za-z]:)?[A-Za-z0-9_.*~/\\-]*")  # C:/x, ~/x, .\x — no other drive
+
+
+def _local_path(token: str) -> bool:
+    if not _LOCAL_PATH.fullmatch(token):
+        return False
+    norm = token.replace("/", "\\")
+    return not norm.startswith("\\\\") and "\\\\" not in norm  # no UNC in any slash mix
+
+
+def _args_ok(args: list[str], flags: set[str], value: "re.Pattern[str] | None" = None, path: bool = False) -> bool:
+    for a in args:
+        if a.startswith("-"):
+            if a.lower() not in flags:
+                return False
+        elif path:
+            if not _local_path(a):
+                return False
+        elif value is None or not value.fullmatch(a):
+            return False
+    return True
+
 
 SAFE_APPS = {
     "notepad", "calc", "mspaint", "chrome", "msedge", "firefox", "spotify", "code",
@@ -91,20 +130,18 @@ def _safe_segment(segment: str, piped: bool) -> bool:
     # Outside an opener's URL, no metacharacters and no quotes at all.
     if _META.search(segment) or "'" in segment:
         return False
-    if any(BAD_PARAMS.match(a) for a in args):
-        return False
     if piped:
-        return word in PIPE_FILTERS
+        return word in PIPE_FILTERS and _args_ok(args, PIPE_FILTERS[word], _PLAIN)
     if word in EXACT:
         return tuple(a.lower() for a in args) in EXACT[word]
     if word in NO_ARGS:
-        return all(a.startswith("-") for a in args)
+        return _args_ok(args, NO_ARGS[word])
     if word in NAME_ARGS:
-        return all(re.fullmatch(r"-?[A-Za-z0-9_.*\-]+", a) for a in args)
+        return _args_ok(args, NAME_ARGS[word], _PLAIN)
     if word in PATH_ARGS:
-        return all(re.fullmatch(r"-?[A-Za-z0-9_.*:~/\\-]+", a) for a in args)
+        return _args_ok(args, PATH_ARGS[word], path=True)
     if word in TEXT_ARGS:
-        return all(re.fullmatch(r"[\w.,:!?*\-]+", a, re.UNICODE) for a in args)
+        return all(re.fullmatch(r"[\w.,:?*]+", a, re.UNICODE) for a in args)
     return False
 
 
@@ -127,20 +164,30 @@ def is_safe_tool(tool: str, tool_input: dict) -> bool:
     return False
 
 
-YES = re.compile(r"^\W*(да|так|yes|ага|угу|давай|выполняй|выполни|разрешаю|подтверждаю|конечно|окей|ок|ok)\b", re.IGNORECASE)
-NO = re.compile(r"\b(нет|не надо|не делай|не нужно|отмена|отмени|стоп|отклони|запрещаю|не разрешаю|no|ні)\b", re.IGNORECASE)
+YES_WORDS = {"да", "yes", "давай", "выполняй", "выполни", "разрешаю", "подтверждаю", "конечно", "разрешаю"}
+NO_WORDS = {"нет", "no", "отмена", "отмени", "отклони", "запрещаю", "стоп", "ні"}
+# Words that may surround a clear answer without changing it.
+FILLER = {"сэр", "джарвис", "пожалуйста", "можно", "можешь", "ладно", "ок", "окей"}
+NEGATION_PHRASE = {"не", "надо", "делай", "нужно", "разрешаю"}
 
 
 def parse_answer(text: str) -> Optional[bool]:
-    """A short, unambiguous yes/no only: a phone call in the room must not approve a command."""
-    words = re.findall(r"\w+", text, re.UNICODE)
+    """A short, unambiguous yes/no only.
+
+    Every word must belong to the answer: "так себе", "ага щас", "да, но не сейчас" or
+    a phone call in the room never approve a command.
+    """
+    words = [w.lower() for w in re.findall(r"\w+", text, re.UNICODE)]
     if not words or len(words) > 4:
         return None
-    no, yes = NO.search(text), YES.search(text)
-    if no and not yes:
-        return False
-    if yes and not no:
+    has_yes = any(w in YES_WORDS for w in words)
+    has_no = any(w in NO_WORDS for w in words) or "не" in words
+    if has_yes and not has_no and all(w in YES_WORDS or w in FILLER for w in words):
         return True
+    if has_no and not has_yes and all(w in NO_WORDS or w in FILLER or w in NEGATION_PHRASE for w in words):
+        return False
+    if has_no and "не" in words and all(w in NO_WORDS or w in FILLER or w in NEGATION_PHRASE for w in words):
+        return False  # "не разрешаю"
     return None  # unclear: keep waiting
 
 
