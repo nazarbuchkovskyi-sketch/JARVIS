@@ -9,7 +9,6 @@ where node >nul 2>nul || (echo [Jarvis] Node.js not found. Install the LTS versi
 where claude >nul 2>nul || (echo [Jarvis] Claude Code not found. Install it: https://code.claude.com/docs - then run "claude" and log in. & goto :fail)
 
 echo [Jarvis] 1/3 Python packages...
-python -m pip install --upgrade pip || goto :fail
 python -m pip install -r requirements.txt || goto :fail
 
 echo [Jarvis] 2/3 Interface...
