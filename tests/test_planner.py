@@ -368,3 +368,17 @@ def test_workspace_timezone_fallback():
     db2 = DB(PlannerSettings("postgresql://x@h/db", "Vlad", timezone="Asia/Makassar"))
     db2.user()
     assert db2.timezone_name() == "Asia/Makassar"
+
+
+@pytest.mark.parametrize("raw", [
+    "\x1b[200~postgresql://postgres:pw@h.proxy.rlwy.net:36277/railway\x1b[201~",
+    "  'postgresql://postgres:pw@h.proxy.rlwy.net:36277/railway'\r\n",
+    "DATABASE_PUBLIC_URL=postgresql://postgres:pw@h.proxy.rlwy.net:36277/railway\x16",
+])
+def test_clean_pasted_url(raw):
+    from jarvis.planner_setup import clean_url, describe_url
+
+    url = clean_url(raw)
+    assert url == "postgresql://postgres:pw@h.proxy.rlwy.net:36277/railway"
+    d = describe_url(url)
+    assert "'railway'" in d and "pw" not in d.replace("proxy", "")

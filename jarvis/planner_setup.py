@@ -14,10 +14,11 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import re
 import secrets
 import sys
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from .planner import ENV_FILE, PlannerDB, PlannerError, header_line, load_settings, planner_day, read_env_file
 
@@ -171,6 +172,25 @@ def run_check(env_path: Path = ENV_FILE) -> int:
     return 0
 
 
+_PASTE_MARKERS = re.compile(r"\x1b\[20[01]~|\x16")  # bracketed-paste markers, a literal Ctrl+V
+
+
+def clean_url(raw: str) -> str:
+    """A pasted connection string without terminal paste markers, control characters, spaces or quotes."""
+    s = _PASTE_MARKERS.sub("", raw or "")
+    s = "".join(ch for ch in s if ch.isprintable() and not ch.isspace())
+    s = s.strip("'\"`")
+    m = re.search(r"postgres(?:ql)?://", s)  # anything typed before the scheme (e.g. "DATABASE_PUBLIC_URL=")
+    return s[m.start():] if m else s
+
+
+def describe_url(url: str) -> str:
+    """Where we connect, without the password (database names and hosts are not secret)."""
+    p = urlsplit(url)
+    db = unquote(p.path.lstrip("/")) or "(не указана)"
+    return f"Подключаюсь: сервер {p.hostname}:{p.port or 5432}, пользователь {p.username!r}, база {db!r}"
+
+
 def main(argv=None) -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -180,11 +200,12 @@ def main(argv=None) -> int:
     try:
         if args.check:
             return run_check()
-        admin = os.environ.get("PLANNER_ADMIN_URL") or getpass.getpass(
-            "Вставьте DATABASE_PUBLIC_URL из Railway (ввод скрыт) и нажмите Enter: ").strip()
+        admin = clean_url(os.environ.get("PLANNER_ADMIN_URL") or getpass.getpass(
+            "Вставьте DATABASE_PUBLIC_URL из Railway (ввод скрыт) и нажмите Enter: "))
         if not admin.startswith(("postgres://", "postgresql://")):
             print("Это не похоже на строку подключения postgresql://…")
             return 1
+        print(describe_url(admin))
         if "railway.internal" in admin:
             print("Это внутренний адрес Railway (DATABASE_URL). Нужен DATABASE_PUBLIC_URL "
                   "(Postgres → Settings → Networking → Public Networking / TCP Proxy).")
