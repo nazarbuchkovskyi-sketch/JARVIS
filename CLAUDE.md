@@ -57,11 +57,13 @@ All tests must pass (they never touch the mic or camera).
 
 ## 3. Launch
 
-Jarvis must keep running after your command returns, so start it in **its own console window**
-(do not run `start.bat` directly inside your shell tool — it would be killed when the call ends):
+Jarvis must keep running after your command returns. Start it with the hidden launcher `Jarvis.vbs`:
+no console window, only the Jarvis window appears (do not run `start.bat` inside your shell tool — it would
+be killed when the call ends). On the very first run (no `ui/dist` or `models/.ready`) the launcher opens
+the visible `start.bat` instead, because downloads need a console.
 
 ```powershell
-Start-Process -FilePath cmd.exe -ArgumentList "/k", "title Jarvis && .\start.bat" -WorkingDirectory (Get-Location)
+Start-Process wscript.exe -ArgumentList ('"' + (Join-Path (Get-Location) 'Jarvis.vbs') + '"')
 ```
 
 Run this from PowerShell (the Windows default shell).
@@ -81,7 +83,7 @@ window titled **Jarvis** is open. Poll for that; don't just sleep.
 - Talk over him to interrupt; «стоп» / «хватит» makes him shut up. **Esc** or the «Стоп» button too.
 - When it is quiet he looks at the camera and teases on his own (switch «Сам комментирует»).
 - The mic and camera work **only while the Jarvis window is open**; closing it shuts Jarvis down
-  after 5 s. Start again with the command from step 3 (or double-click `start.bat`).
+  after 5 s. Start again with the command from step 3 (or double-click `Jarvis.vbs`; `start.bat` = same with a console).
 - Each reply uses the user's Claude subscription limits, like a normal Claude Code message.
 
 ## Troubleshooting
@@ -95,6 +97,6 @@ window titled **Jarvis** is open. Poll for that; don't just sleep.
 - Camera black / error → Privacy & security → Camera → allow desktop apps; close other apps
   using the camera; `camera_index` in `config.json`.
 - «Мозг недоступен» → run `claude` once in a terminal and `/login`.
-- Logs: the Jarvis console window shows everything (`stt ...`, `turn query: first sentence ...`).
+- Logs: `logs\jarvis.log` (`stt ...`, `turn query: first sentence ...`); `start.bat` shows the same live in a console.
 
 Settings live in `config.json` (documented in `README.md`).

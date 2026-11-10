@@ -834,7 +834,10 @@ class Jarvis:
                 return  # decided at the end: it may turn out to be "SKIP"
             speak(delta)
 
+        tools_used: list[str] = []
+
         def on_tool(summary: str) -> None:
+            tools_used.append(summary.split(":", 1)[0])
             if proactive:
                 return  # a silent look at the camera: no "thinking" flicker in the window
             self.emit({"type": "tool", "id": turn_id, "text": summary})
@@ -863,8 +866,9 @@ class Jarvis:
                     self._current["spoke"] = True
                 self.voice.say(sentence)
                 self.set_state("speaking")
-        log.info("turn %s: first sentence %.2fs, total %.2fs%s | %r", "proactive" if proactive else "query",
-                 st["first"] or -1, time.time() - t0, " (skipped)" if skipped else "", (result.text or "")[:300])
+        log.info("turn %s: first sentence %.2fs, total %.2fs%s tools=%s%s | %r", "proactive" if proactive else "query",
+                 st["first"] or -1, time.time() - t0, " (skipped)" if skipped else "", ",".join(tools_used) or "-",
+                 " interrupted" if result.interrupted or self._cancel.is_set() else "", (result.text or "")[:300])
         if proactive and skipped:
             if not result.ok:
                 log.warning("proactive turn failed: %s", result.error)
