@@ -147,8 +147,12 @@ class FakeDB:
     def todos(self, day=None):
         return [{"title": "купить кофе", "kind": "personal", "date": "2026-11-01"}]
 
-    def tasks(self):
+    def tasks(self, who="me"):
+        self.calls.append(("tasks", who))
         return [{"title": "лендинг", "status": "doing", "priority": "P1", "due": "2026-11-09", "project": "ShareMe"}]
+
+    def partner_work(self, start, end):
+        return [{"who": "Nazar", **ev("Jarvis для Влада", 900, 960).as_dict()}]
 
     def week_focus(self, day):
         return {"week_start": "2026-11-09", "focus": "запуск", "outcomes": []}
@@ -382,3 +386,23 @@ def test_clean_pasted_url(raw):
     assert url == "postgresql://postgres:pw@h.proxy.rlwy.net:36277/railway"
     d = describe_url(url)
     assert "'railway'" in d and "pw" not in d.replace("proxy", "")
+
+
+@pytest.mark.parametrize("title,work,expected", [
+    ("Jarvis", None, True), ("Сніданок", None, False), ("YouTube", None, False),
+    ("Сніданок", True, True), ("Созвон", False, False),
+])
+def test_partner_work_heuristic_matches_platform(title, work, expected):
+    from jarvis.planner import is_work_event
+
+    assert is_work_event(title, work) is expected
+
+
+def test_mcp_day_has_partner_work_and_tasks_scope():
+    db = FakeDB()
+    h = Handlers(db)
+    day = json.loads(rpc("tools/call", {"name": "planner_day"}, handlers=h)["result"]["content"][0]["text"])
+    assert day["partner_work"][0]["who"] == "Nazar"
+    rpc("tools/call", {"name": "planner_tasks", "arguments": {"who": "all"}}, handlers=h)
+    rpc("tools/call", {"name": "planner_tasks"}, handlers=h)
+    assert [c for c in db.calls if c[0] == "tasks"] == [("tasks", "all"), ("tasks", "me")]

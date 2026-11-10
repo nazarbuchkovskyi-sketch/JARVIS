@@ -32,8 +32,9 @@ _RO = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "
 TOOLS: list[dict] = [
     {
         "name": "planner_day",
-        "description": "The user's plan for one day from the Planning System: calendar time blocks "
-                       "(time, title, done) and open to-dos for that day. Default: today. Read-only.",
+        "description": "The user's plan for one day from the Planning System: their calendar time blocks "
+                       "(time, title, done), open to-dos for that day, and the partner's work blocks that day "
+                       "(partner_work, with who). Default: today. Read-only.",
         "inputSchema": {"type": "object", "properties": {"date": _DATE}, "additionalProperties": False},
     },
     {
@@ -45,7 +46,8 @@ TOOLS: list[dict] = [
     },
     {
         "name": "planner_range",
-        "description": f"The user's calendar blocks for a date range (at most {MAX_RANGE_DAYS} days), e.g. the week. Read-only.",
+        "description": f"The user's calendar blocks for a date range (at most {MAX_RANGE_DAYS} days), e.g. the week, "
+                       "plus the partner's work blocks in that range (partner_work). Read-only.",
         "inputSchema": {"type": "object", "properties": {"from": _DATE, "to": _DATE},
                         "required": ["from", "to"], "additionalProperties": False},
     },
@@ -67,8 +69,11 @@ TOOLS: list[dict] = [
     },
     {
         "name": "planner_tasks",
-        "description": "Open team tasks (kanban) assigned to the user: status, priority, due date, project. Read-only.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "Open team tasks (kanban board): status, priority, due date, project, assignee. "
+                       "who='me' (default) = assigned to the user; who='all' = the whole team board. Read-only.",
+        "inputSchema": {"type": "object", "properties": {
+            "who": {"type": "string", "enum": ["me", "all"]},
+        }, "additionalProperties": False},
     },
     {
         "name": "planner_week_focus",
@@ -108,7 +113,8 @@ class Handlers:
         day = parse_day(a.get("date"), now)
         events = db.events(day, day)
         out = {**self._base(db), "date": day.isoformat(), "weekday": _weekday(day),
-               "calendar": [e.as_dict() for e in events], "todos": db.todos(day)}
+               "calendar": [e.as_dict() for e in events], "todos": db.todos(day),
+               "partner_work": db.partner_work(day, day)}
         if day == planner_day(now):
             out["now_line"] = header_line(events, now)
         return out
@@ -132,9 +138,13 @@ class Handlers:
         days: dict[str, list] = {}
         for e in events:
             days.setdefault(e.date.isoformat(), []).append(e.as_dict())
+        partner: dict[str, list] = {}
+        for p in db.partner_work(start, end):
+            partner.setdefault(p["date"], []).append(p)
         return {**self._base(db), "from": min(start, end).isoformat(), "to": max(start, end).isoformat(),
-                "days": [{"date": d, "weekday": _weekday(dt.date.fromisoformat(d)), "calendar": v}
-                         for d, v in sorted(days.items())]}
+                "days": [{"date": d, "weekday": _weekday(dt.date.fromisoformat(d)), "calendar": days.get(d, []),
+                          **({"partner_work": partner[d]} if d in partner else {})}
+                         for d in sorted(set(days) | set(partner))]}
 
     def t_planner_search(self, a: dict) -> dict:
         db = self._db()
@@ -158,7 +168,7 @@ class Handlers:
     def t_planner_tasks(self, a: dict) -> dict:
         db = self._db()
         today = planner_day(db.now()).isoformat()
-        tasks = db.tasks()
+        tasks = db.tasks("all" if a.get("who") == "all" else "me")
         for t in tasks:
             if t["due"] and t["due"] < today:
                 t["overdue"] = True

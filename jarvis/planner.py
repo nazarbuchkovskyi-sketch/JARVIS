@@ -289,6 +289,22 @@ def pick_address(user_title: str, rng=random) -> str:
     return rng.choice([user_title or "сэр", "братан", "шеф"])
 
 
+# Same heuristic as the platform (lib/calendar/model.ts): which unflagged blocks count as work.
+_WASTED = re.compile(r"згаян|весран|прокрастин|waste|chill|youtube|tiktok|scroll|game|ігр|серіал|фільм")
+_ROUTINE = re.compile(r"побут|рутин|спорт|зал|тренуван|їж|обід|сніданок|вечер|сон|rest|routine|gym|walk|"
+                      r"прогулянк|магазин|купит|душ|прибиран")
+
+
+def is_work_event(title: str, work: Optional[bool]) -> bool:
+    """getEventCategory(e) === "work": an explicit flag wins, otherwise the title decides."""
+    if work is True:
+        return True
+    if work is False:
+        return False
+    t = (title or "").lower()
+    return not (_WASTED.search(t) or _ROUTINE.search(t))
+
+
 def _like_pattern(query: str) -> str:
     q = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{q}%"
@@ -454,18 +470,43 @@ class PlannerDB:
             out.append({"title": title, "kind": kind, "date": d.isoformat() if d else None})
         return out
 
-    def tasks(self) -> list[dict]:
-        """Open team tasks (kanban) assigned to the user."""
+    def partner_work(self, start: dt.date, end: dt.date) -> list[dict]:
+        """Work blocks of the other people in the planner — what the user sees of them on the platform
+        (the platform shows a partner's work-marked events, never their private ones)."""
+        if end < start:
+            start, end = end, start
+        if (end - start).days > MAX_RANGE_DAYS:
+            raise PlannerError(f"Слишком длинный период: не больше {MAX_RANGE_DAYS} дней за раз.")
         uid = self.user()["id"]
         rows = self._query(
-            "SELECT t.title, t.status, t.priority, t.due_date, p.name FROM tasks t "
-            "LEFT JOIN projects p ON p.id = t.project_id "
-            "WHERE t.assignee_id = %s AND t.status <> 'done' AND NOT t.is_demo "
-            "ORDER BY t.due_date NULLS LAST, t.priority, t.id LIMIT 200",
-            (uid,),
+            "SELECT e.id, e.title, e.date, e.start_min, e.end_min, e.done, e.work, u.name FROM calendar_events e "
+            "LEFT JOIN users u ON u.id = e.user_id "
+            "WHERE e.user_id <> %s AND e.date BETWEEN %s AND %s AND (e.work IS NULL OR e.work) "
+            "ORDER BY e.date, e.start_min LIMIT 1000",
+            (uid, start, end),
+        )
+        out = []
+        for r in rows:
+            if not is_work_event(r[1], r[6]):
+                continue
+            ev = Event(str(r[0]), r[1], _as_date(r[2]), int(r[3]), int(r[4]), bool(r[5]))
+            out.append({"who": r[7], **ev.as_dict()})
+        return out
+
+    def tasks(self, who: str = "me") -> list[dict]:
+        """Open team tasks (kanban): the user's own ("me") or the whole board ("all"), as on the platform."""
+        uid = self.user()["id"]
+        mine_only = who != "all"
+        rows = self._query(
+            "SELECT t.title, t.status, t.priority, t.due_date, p.name, u.name, t.assignee_id FROM tasks t "
+            "LEFT JOIN projects p ON p.id = t.project_id LEFT JOIN users u ON u.id = t.assignee_id "
+            "WHERE t.status <> 'done' AND NOT t.is_demo AND (NOT %s OR t.assignee_id = %s) "
+            "ORDER BY t.due_date NULLS LAST, t.priority, t.id LIMIT 300",
+            (mine_only, uid),
         )
         return [{"title": r[0], "status": r[1], "priority": f"P{r[2]}",
-                 "due": _as_date(r[3]).isoformat() if r[3] is not None else None, "project": r[4]} for r in rows]
+                 "due": _as_date(r[3]).isoformat() if r[3] is not None else None, "project": r[4],
+                 "assignee": r[5], "mine": r[6] == uid} for r in rows]
 
     def week_focus(self, day: dt.date) -> Optional[dict]:
         monday = day - dt.timedelta(days=day.weekday())
