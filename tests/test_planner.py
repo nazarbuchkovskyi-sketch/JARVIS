@@ -366,6 +366,9 @@ def test_workspace_timezone_fallback():
             assert "key = 'timezone'" in sql
             return [("Europe/Kyiv",)]
 
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+
     db = DB(PlannerSettings("postgresql://x@h/db", "Vlad"))
     db.user()
     assert db.timezone_name() == "Europe/Kyiv"
@@ -406,3 +409,10 @@ def test_mcp_day_has_partner_work_and_tasks_scope():
     rpc("tools/call", {"name": "planner_tasks", "arguments": {"who": "all"}}, handlers=h)
     rpc("tools/call", {"name": "planner_tasks"}, handlers=h)
     assert [c for c in db.calls if c[0] == "tasks"] == [("tasks", "all"), ("tasks", "me")]
+
+
+def test_shift_tz_kyiv_to_bali():
+    from jarvis.planner import shift_tz
+
+    assert shift_tz(dt.datetime(2026, 11, 10, 14, 17), "Europe/Kyiv", "Asia/Makassar") == dt.datetime(2026, 11, 10, 20, 17)
+    assert shift_tz(dt.datetime(2026, 11, 10, 14, 17), "Nowhere/Zone", "Asia/Makassar") is None

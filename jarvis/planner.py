@@ -412,14 +412,14 @@ class PlannerDB:
             raise PlannerError(f"PLANNER_USER={ref!r} подходит нескольким пользователям, укажите email или id.")
         uid, name, tz = rows[0]
         user = {"id": int(uid), "name": name, "timezone": tz, "workspace_timezone": None}
-        if not tz and not self.settings.timezone:
-            # Like the platform: no personal zone -> the workspace zone (settings.timezone, default Kyiv).
-            try:
-                ws = self._query("SELECT value FROM settings WHERE key = 'timezone'")
-                value = ws[0][0] if ws else None
-                user["workspace_timezone"] = value if isinstance(value, str) and value else "Europe/Kyiv"
-            except PlannerError as exc:
-                log.info("workspace time zone unavailable (%s), using this PC's clock", exc)
+        # Like the platform: no personal zone -> the workspace zone (settings.timezone, default Kyiv).
+        # Also needed to place a partner's blocks (they are in the partner's wall clock).
+        try:
+            ws = self._query("SELECT value FROM settings WHERE key = 'timezone'")
+            value = ws[0][0] if ws else None
+            user["workspace_timezone"] = value if isinstance(value, str) and value else "Europe/Kyiv"
+        except PlannerError as exc:
+            log.info("workspace time zone unavailable (%s), using this PC's clock", exc)
         self._user = user
         return self._user
 
@@ -479,18 +479,28 @@ class PlannerDB:
             raise PlannerError(f"Слишком длинный период: не больше {MAX_RANGE_DAYS} дней за раз.")
         uid = self.user()["id"]
         rows = self._query(
-            "SELECT e.id, e.title, e.date, e.start_min, e.end_min, e.done, e.work, u.name FROM calendar_events e "
+            "SELECT e.id, e.title, e.date, e.start_min, e.end_min, e.done, e.work, u.name, u.timezone "
+            "FROM calendar_events e "
             "LEFT JOIN users u ON u.id = e.user_id "
             "WHERE e.user_id <> %s AND e.date BETWEEN %s AND %s AND (e.work IS NULL OR e.work) "
             "ORDER BY e.date, e.start_min LIMIT 1000",
             (uid, start, end),
         )
+        mine_tz = self.timezone_name()
         out = []
         for r in rows:
             if not is_work_event(r[1], r[6]):
                 continue
             ev = Event(str(r[0]), r[1], _as_date(r[2]), int(r[3]), int(r[4]), bool(r[5]))
-            out.append({"who": r[7], **ev.as_dict()})
+            item = {"who": r[7], **ev.as_dict()}
+            their_tz = r[8] or (self._user or {}).get("workspace_timezone")
+            if their_tz and mine_tz and their_tz != mine_tz:
+                # The block is in the partner's wall clock; also give it in the user's own time.
+                start, end = shift_tz(ev.start, their_tz, mine_tz), shift_tz(ev.end, their_tz, mine_tz)
+                if start is not None and end is not None:
+                    item["their_timezone"] = their_tz
+                    item["in_your_time"] = f"{start:%Y-%m-%d %H:%M}–{end:%H:%M}"
+            out.append(item)
         return out
 
     def tasks(self, who: str = "me") -> list[dict]:
@@ -534,6 +544,16 @@ class PlannerDB:
             (uid, start, end, _like_pattern(query[:100])),
         )
         return [Event(str(r[0]), r[1], _as_date(r[2]), int(r[3]), int(r[4]), bool(r[5])) for r in rows]
+
+
+def shift_tz(moment: dt.datetime, from_tz: str, to_tz: str) -> Optional[dt.datetime]:
+    """A naive wall-clock time in one zone as the naive wall-clock time in another (None if a zone is unknown)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return moment.replace(tzinfo=ZoneInfo(from_tz)).astimezone(ZoneInfo(to_tz)).replace(tzinfo=None)
+    except Exception:
+        return None
 
 
 def _as_date(value: Any) -> dt.date:
