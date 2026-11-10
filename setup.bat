@@ -22,6 +22,7 @@ python -m jarvis.setup_models || goto :fail
 
 echo.
 echo [Jarvis] Done. Start Jarvis with start.bat
+echo [Jarvis] Optional: connect your Planning System read-only with: python -m jarvis.planner_setup
 pause
 goto :eof
 

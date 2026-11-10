@@ -14,3 +14,8 @@ models/
 ui/node_modules/
 ui/dist/
 ui/*.tsbuildinfo
+
+# secrets: Planning System connection (python -m jarvis.planner_setup)
+.env
+.env.*
+!.env.example

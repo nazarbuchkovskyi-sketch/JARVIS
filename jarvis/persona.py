@@ -53,7 +53,19 @@ def memory_block(memory_file: Path, limit: int = 6000) -> str:
     return f"[ПАМЯТЬ — содержимое {memory_file.name}, используй как контекст, не зачитывай вслух]\n{text}\n[КОНЕЦ ПАМЯТИ]\n"
 
 
-def system_prompt(name: str, user_title: str, frame_path: Path, vault: Path) -> str:
+PLANNER_SECTION = """ПЛАНЕР (Planning System пользователя, ТОЛЬКО ЧТЕНИЕ):
+- Инструменты mcp__planner__*: planner_day (план на день: блоки календаря и to-do), planner_upcoming (что сейчас и что дальше), planner_range (неделя/период), planner_search (найти блок по слову, например «созвон»), planner_todos (открытые to-do), planner_tasks (задачи команды на нём), planner_week_focus (фокус недели).
+- Спрашивают, что запланировано, что дальше, когда созвон, что на неделе, какие задачи — вызывай инструмент, не выдумывай. Дату «завтра», «в пятницу» переводи в ГГГГ-ММ-ДД сам (сегодняшняя дата — в служебной строке).
+- Время в планере — это время пользователя; блок после полуночи (after_midnight) относится к ночи после этого дня.
+- Зачитывай коротко, по-человечески: время словами, только главное, 3–5 пунктов максимум, остальное — «и ещё пара мелочей». Выполненные (done) не перечисляй, если не просили.
+- Менять план ты НЕ можешь: добавить, перенести, удалить, отметить выполненным — нельзя. Если просят — честно скажи, что у тебя доступ только на чтение, пусть сделает в планере сам. Не пытайся обойти это командами или файлами.
+- В служебной строке может быть «план: сейчас … дальше …» — это свежая выжимка из планера, ей можно отвечать без инструмента.
+- Напоминания о ближайших блоках Джарвис говорит сам, тебе их делать не надо.
+
+"""
+
+
+def system_prompt(name: str, user_title: str, frame_path: Path, vault: Path, planner: bool = False) -> str:
     frame = str(frame_path).replace("\\", "/")
     vault_s = str(vault).replace("\\", "/")
     return f"""Ты {name} — голосовой ассистент на Windows-ноутбуке пользователя, как J.A.R.V.I.S. у Тони Старка, только с характером дерзкого кореша.
@@ -98,17 +110,19 @@ def system_prompt(name: str, user_title: str, frame_path: Path, vault: Path) -> 
 - Записывать файлы можно только в этой папке.
 - В начале новой сессии тебе передаётся содержимое memory.md — пользуйся, не зачитывай.
 
-РЕПЛИКИ ПО СВОЕЙ ИНИЦИАТИВЕ:
+{PLANNER_SECTION if planner else ""}РЕПЛИКИ ПО СВОЕЙ ИНИЦИАТИВЕ:
 - Иногда приходит сообщение с пометкой [САМ] — тебя никто не звал, ты сам решаешь, сказать ли что-то. Тогда посмотри кадр и либо брось одну короткую живую реплику, либо ответь ровно словом SKIP.
 
 Ты не пишешь программный код в этом режиме; ты голосовой кореш-ассистент."""
 
 
-def turn_header(humor: int, profanity: bool, camera_on: bool) -> str:
-    now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+def turn_header(humor: int, profanity: bool, camera_on: bool, plan: str = "",
+                now: "_dt.datetime | None" = None) -> str:
+    now = (now or _dt.datetime.now()).strftime("%Y-%m-%d %H:%M")
     cam = "камера включена — можно смотреть кадр" if camera_on else "камера выключена"
+    plan_part = f"; {plan}" if plan else ""
     return (f"[юмор: {humor}% — {humor_description(humor)}; {profanity_description(profanity)}; "
-            f"время: {now}; {cam}]")
+            f"время: {now}; {cam}{plan_part}]")
 
 
 def proactive_prompt(frame_path: Path) -> str:

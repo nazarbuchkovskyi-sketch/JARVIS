@@ -185,7 +185,8 @@ class Jarvis:
         self.config = config
         self.bus = EventBus()
         self.state = "booting"
-        self.status: dict[str, str] = {"brain": "загрузка", "ears": "загрузка", "voice": "загрузка", "eyes": "выключено"}
+        self.status: dict[str, str] = {"brain": "загрузка", "ears": "загрузка", "voice": "загрузка", "eyes": "выключено",
+                                       "planner": "не подключён"}
         self.history: deque[dict] = deque(maxlen=60)
         self.mic_level = 0.0
         self.out_level = 0.0
@@ -212,6 +213,9 @@ class Jarvis:
         self.ears = None
         self.voice = None
         self.eyes = None
+        self.planner = None  # PlannerService when planner.env has PLANNER_DATABASE_URL
+        self._reminded: set = set()  # reminder keys already spoken
+        self._remind_wait: list = []  # due reminders waiting for a quiet moment
 
     # ---- events ------------------------------------------------------------
     def emit(self, event: dict) -> None:
@@ -250,6 +254,7 @@ class Jarvis:
         threading.Thread(target=self._turn_loop, daemon=True, name="turns").start()
         threading.Thread(target=self._ticker, daemon=True, name="ticker").start()
         threading.Thread(target=self._proactive_loop, daemon=True, name="proactive").start()
+        threading.Thread(target=self._planner_loop, daemon=True, name="planner").start()
 
     def _brain_settings(self, frame_path: Path):
         from .brain import BrainSettings
@@ -257,12 +262,25 @@ class Jarvis:
         cfg = self.config
         home = Path.home().as_posix()
         hook = f'"{Path(sys.executable).as_posix()}" -I "{(ROOT / "jarvis" / "approve_hook.py").as_posix()}"'
+        planner = self.planner is not None
+        allowed = list(cfg["claude_allowed_tools"])
+        mcp_servers: dict = {}
+        if planner:
+            # Read-only planner tools; the server reads planner.env itself, so no secret is on a command line.
+            mcp_servers["planner"] = {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": ["-I", str(ROOT / "jarvis" / "planner_mcp.py")],
+            }
+            allowed.append("mcp__planner")
         return BrainSettings(
             model=cfg["claude_model"],
             effort=cfg.get("claude_effort"),
-            system_prompt=persona.system_prompt(cfg["assistant_name"], cfg["user_title"], frame_path, VAULT_DIR),
+            system_prompt=persona.system_prompt(cfg["assistant_name"], cfg["user_title"], frame_path, VAULT_DIR,
+                                                planner=planner),
             cwd=WORKSPACE_DIR,
-            allowed_tools=list(cfg["claude_allowed_tools"]),
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed,
             disallowed_tools=list(cfg["claude_disallowed_tools"]),
             # Jarvis must not inherit the user's global coding instructions.
             # Nor the repo's own CLAUDE.md/AGENTS.md (setup instructions for Claude Code, not for him).
@@ -289,6 +307,7 @@ class Jarvis:
         frame_path = VISION_DIR / "latest.jpg"
         WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
         persona.ensure_vault(VAULT_DIR)
+        self._init_planner()  # before the brain: it decides whether Claude gets the planner tools
 
         self.eyes = Eyes(int(cfg["camera_index"]), frame_path)
         if cfg["camera_enabled"]:
@@ -733,7 +752,13 @@ class Jarvis:
             # The mic stays open during the turn so the user can cut in (see _barge_in).
             self._current = {"kind": turn.kind, "text": turn.text, "started": time.time(), "spoke": False}
             try:
-                if turn.kind == "local":
+                if turn.kind == "remind":  # a planner reminder: said by Jarvis on his own, no user line
+                    self._log("assistant", turn.text, reminder=True)
+                    if self.voice is not None:
+                        self.set_state("speaking")
+                        self._current["spoke"] = True
+                        self.voice.say(turn.text)
+                elif turn.kind == "local":
                     self._log("user", turn.shown)
                     if self.voice is not None:
                         self.set_state("speaking")
@@ -749,7 +774,8 @@ class Jarvis:
                 log.exception("turn failed")
                 self._log("system", f"Ошибка: {exc}")
             finally:
-                spoke = bool(self._current and self._current.get("spoke"))
+                # A reminder opens no follow-up window: room talk after it must not reach Claude unaddressed.
+                spoke = bool(self._current and self._current.get("spoke")) and turn.kind != "remind"
                 self._current = None
                 self._finish_turn(cancelled=self._cancel.is_set(), spoke=spoke)
 
@@ -815,7 +841,9 @@ class Jarvis:
             if self.approvals.pending is None:
                 self.set_state("thinking")
 
-        header = persona.turn_header(int(self.config["humor"]), bool(self.config["profanity"]), bool(self.eyes and self.eyes.enabled))
+        header = persona.turn_header(int(self.config["humor"]), bool(self.config["profanity"]),
+                                     bool(self.eyes and self.eyes.enabled), plan=self._plan_line(),
+                                     now=self._planner_now())
         result = self.brain.ask(
             f"{header}\n{text}",
             on_delta=on_delta,
@@ -898,3 +926,98 @@ class Jarvis:
                 self._turns.put(Turn("proactive", persona.proactive_prompt(frame), "", self._gen))
             except Exception:
                 log.exception("proactive loop failed")
+
+    # ---- planner (Planning System, read-only): context and reminders ---------
+    def _init_planner(self) -> None:
+        from .planner import PlannerDB, PlannerError, PlannerService, load_settings
+
+        try:
+            settings = load_settings()
+        except PlannerError as exc:
+            self.set_status("planner", "ошибка")
+            self._log("system", f"Планер: {exc}")
+            return
+        if settings is None:
+            return  # not configured: no tools, no reminders
+        try:
+            import psycopg  # noqa: F401
+        except ImportError:
+            self.set_status("planner", "ошибка")
+            self._log("system", "Планер: не установлен пакет psycopg. Запустите setup.bat.")
+            return
+        db = PlannerDB(settings)
+        self.planner = PlannerService(db, poll_seconds=float(self.config.get("planner_poll_seconds", 60)))
+        self.set_status("planner", "подключение")
+        log.info("planner configured: %r", settings)
+
+    def _plan_line(self) -> str:
+        """'план: сейчас … дальше …' for the turn header, from the cached calendar (no DB call here)."""
+        from .planner import header_line
+
+        p = self.planner
+        if p is None or p.error or not p.fresh():
+            return ""
+        try:
+            return header_line(p.snapshot(), p.db.now())
+        except Exception:
+            log.exception("plan line failed")
+            return ""
+
+    def _planner_now(self):
+        """The planner's wall clock (its time zone) once the user is known, else None (= this PC)."""
+        p = self.planner
+        if p is None or p.db._user is None:
+            return None
+        try:
+            return p.db.now()
+        except Exception:
+            return None
+
+    def _reminder_ready(self) -> bool:
+        ears = self.ears
+        return bool(
+            self.window_open and self.voice is not None and not self._busy.is_set() and self._turns.empty()
+            and self.approvals.pending is None and self._barge is None
+            and not (ears is not None and (ears.ptt_active or ears.segmenter.active))
+        )
+
+    def _planner_loop(self) -> None:
+        self._booted.wait()
+        p = self.planner
+        if p is None:
+            return
+        next_refresh = 0.0
+        while True:
+            time.sleep(1.0)
+            try:
+                if time.monotonic() >= next_refresh:
+                    ok = p.refresh()
+                    self.set_status("planner", p.status_text())
+                    next_refresh = time.monotonic() + (p.poll_seconds if ok else min(300.0, p.poll_seconds * 2))
+                self._planner_tick()
+            except Exception:
+                log.exception("planner loop failed")
+                time.sleep(5)
+
+    def _planner_tick(self) -> Optional[str]:
+        """Queue due reminders when the room is quiet; returns the text queued (for tests)."""
+        from .planner import due_reminders, pick_address, reminder_text, still_due
+
+        p = self.planner
+        leads = self.config.get("planner_reminders") or []
+        if p is None or not leads or not p.fresh():  # a failed poll keeps the fresh cache usable
+            return None
+        now = p.db.now()
+        queued = {r.key for r in self._remind_wait}
+        self._remind_wait += [r for r in due_reminders(p.snapshot(), now, leads, self._reminded) if r.key not in queued]
+        live = {(e.id, e.start.isoformat()) for e in p.snapshot() if not e.done}
+        # Missed while busy, or done / moved / deleted meanwhile: drop.
+        self._remind_wait = [r for r in self._remind_wait if still_due(r, now) and r.key[:2] in live]
+        if not self._remind_wait or not self._reminder_ready():
+            return None
+        text = reminder_text(self._remind_wait, now, pick_address(self.config["user_title"]))
+        self._reminded.update(r.key for r in self._remind_wait)
+        self._remind_wait = []
+        log.info("planner reminder: %s", text)
+        self._turns.put(Turn("remind", text, "", self._gen))
+        return text

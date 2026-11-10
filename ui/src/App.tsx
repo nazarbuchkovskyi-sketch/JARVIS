@@ -227,8 +227,9 @@ export default function App() {
     ["Слух", j.status.ears ?? "—"],
     ["Голос", j.status.voice ?? "—"],
     ["Зрение", j.status.eyes ?? "—"],
+    ["План", j.status.planner ?? "—"],
   ];
-  const tone = (v: string) => (/ошибка|недоступ/i.test(v) ? "bad" : /загруз|запуск/i.test(v) ? "wait" : "ok");
+  const tone = (v: string) => (/ошибка|недоступ/i.test(v) ? "bad" : /загруз|запуск|подключ/i.test(v) ? "wait" : "ok");
   const turns = j.log.filter((i) => i.role === "user").length;
 
   return (

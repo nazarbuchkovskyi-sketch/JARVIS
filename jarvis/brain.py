@@ -38,6 +38,7 @@ class BrainSettings:
     exclude_claude_md: list[str] = field(default_factory=list)
     extra_settings: dict = field(default_factory=dict)  # e.g. hooks
     extra_env: dict = field(default_factory=dict)
+    mcp_servers: dict = field(default_factory=dict)  # name -> stdio server config (e.g. the planner)
 
 
 @dataclass
@@ -70,12 +71,14 @@ def build_command(exe: str, s: BrainSettings) -> list[str]:
         # Only project settings: keep the user's global hooks/permissions out of Jarvis,
         # and no user MCP servers or skills either.
         "--setting-sources", "project",
-        "--strict-mcp-config",
+        "--strict-mcp-config",  # only the servers below, never the user's own MCP servers
         "--disable-slash-commands",
         "--no-session-persistence",
     ]
     if s.effort:
         cmd += ["--effort", s.effort]
+    if s.mcp_servers:
+        cmd += ["--mcp-config", json.dumps({"mcpServers": s.mcp_servers}, ensure_ascii=False)]
     settings: dict = dict(s.extra_settings)
     if s.exclude_claude_md:
         settings["claudeMdExcludes"] = s.exclude_claude_md

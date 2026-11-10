@@ -45,6 +45,9 @@ DEFAULTS: dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8765,
     "open_window": True,
+    # Planning System (read-only). The connection itself lives in .env (PLANNER_DATABASE_URL, PLANNER_USER).
+    "planner_reminders": [10],  # minutes before a calendar block to remind; 0 = at its start; [] = off
+    "planner_poll_seconds": 60,
 }
 
 # Always denied, whatever config.json says: Jarvis must never read the user's secrets.

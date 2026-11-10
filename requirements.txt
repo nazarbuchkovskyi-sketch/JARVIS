@@ -14,4 +14,6 @@ onnx-asr[cpu,hub]==0.12.0
 huggingface-hub==0.36.0
 piper-tts==1.8.0
 faster-whisper==1.2.1
+psycopg[binary]==3.3.8
+tzdata==2026.6
 pytest==9.1.1
